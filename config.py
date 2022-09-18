@@ -1,7 +1,7 @@
 #
 import os
 
-model_checkpoint = "./models/macbert"
+model_checkpoint = "./models/resume"
 dist_emb_size = 20
 type_emb_size = 20
 lstm_hid_size = 512
@@ -14,6 +14,6 @@ emb_dropout = 0.5
 conv_dropout = 0.5
 out_dropout = 0.33
 use_bert_last_4_layers = True
-label_num = 5
+label_num = 10
 
 port = int(os.environ.get('PORT', '33136'))

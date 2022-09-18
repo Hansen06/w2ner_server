@@ -7,6 +7,7 @@ from model import Model
 from transformers import AutoTokenizer
 from collections import defaultdict, deque
 import os
+from torch.nn.utils.rnn import pad_sequence
 
 dis2idx = np.zeros((1000), dtype='int64')
 dis2idx[1] = 1
@@ -36,45 +37,87 @@ class W2NER(object):
         with open(os.path.join(config.model_checkpoint, 'id2label.json'), 'r', encoding='utf-8') as f:
             self.id2label = json.load(f)
 
-    def process_bert(self, instance, tokenizer):
+    def process_bert(self, data, tokenizer):
 
-        tokens = [tokenizer.tokenize(word) for word in instance]
-        pieces = [piece for pieces in tokens for piece in pieces]
-        bert_inputs = tokenizer.convert_tokens_to_ids(pieces)
-        bert_inputs = np.array([tokenizer.cls_token_id] + bert_inputs + [tokenizer.sep_token_id])
+        bert_inputs = []
+        grid_mask2d = []
+        pieces2word = []
+        dist_inputs = []
+        sent_length = []
 
-        sent_length = len(instance)
-        grid_labels = np.zeros((sent_length, sent_length), dtype=np.int)
-        pieces2word = np.zeros((sent_length, len(bert_inputs)), dtype=np.bool)
-        dist_inputs = np.zeros((sent_length, sent_length), dtype=np.int)
-        grid_mask2d = np.ones((sent_length, sent_length), dtype=np.bool)
+        for index, instance in enumerate(data):
+            if len(instance) == 0:
+                continue
 
-        if tokenizer is not None:
-            start = 0
-            for i, pieces in enumerate(tokens):
-                if len(pieces) == 0:
-                    continue
-                pieces = list(range(start, start + len(pieces)))
-                pieces2word[i, pieces[0] + 1:pieces[-1] + 2] = 1
-                start += len(pieces)
+            instance = list(instance)
+            tokens = [tokenizer.tokenize(word) for word in instance]
+            pieces = [piece for pieces in tokens for piece in pieces]
+            _bert_inputs = tokenizer.convert_tokens_to_ids(pieces)
+            _bert_inputs = [tokenizer.cls_token_id] + _bert_inputs + [tokenizer.sep_token_id]
 
-        for k in range(sent_length):
-            dist_inputs[k, :] += k
-            dist_inputs[:, k] -= k
+            length = len(instance)
+            _grid_labels = np.zeros((length, length), dtype=np.int)
+            _pieces2word = np.zeros((length, len(_bert_inputs)), dtype=np.bool)
+            _dist_inputs = np.zeros((length, length), dtype=np.int)
+            _grid_mask2d = np.ones((length, length), dtype=np.bool)
 
-        for i in range(sent_length):
-            for j in range(sent_length):
-                if dist_inputs[i, j] < 0:
-                    dist_inputs[i, j] = dis2idx[-dist_inputs[i, j]] + 9
-                else:
-                    dist_inputs[i, j] = dis2idx[dist_inputs[i, j]]
-        dist_inputs[dist_inputs == 0] = 19
+            if tokenizer is not None:
+                start = 0
+                for i, pieces in enumerate(tokens):
+                    if len(pieces) == 0:
+                        continue
+                    pieces = list(range(start, start + len(pieces)))
+                    _pieces2word[i, pieces[0] + 1:pieces[-1] + 2] = 1
+                    start += len(pieces)
 
-        return torch.tensor([bert_inputs], dtype=torch.long, device=self.device), \
-               torch.tensor([grid_mask2d], dtype=torch.long, device=self.device), \
-               torch.tensor([pieces2word], dtype=torch.long, device=self.device), \
-               torch.tensor([dist_inputs], dtype=torch.long, device=self.device), \
-               torch.tensor([sent_length], dtype=torch.long, device=self.device)
+            for k in range(length):
+                _dist_inputs[k, :] += k
+                _dist_inputs[:, k] -= k
+
+            for i in range(length):
+                for j in range(length):
+                    if _dist_inputs[i, j] < 0:
+                        _dist_inputs[i, j] = dis2idx[-_dist_inputs[i, j]] + 9
+                    else:
+                        _dist_inputs[i, j] = dis2idx[_dist_inputs[i, j]]
+            _dist_inputs[_dist_inputs == 0] = 19
+
+            sent_length.append(torch.tensor(length, dtype=torch.long))
+            bert_inputs.append(torch.tensor(_bert_inputs, dtype=torch.long))
+            grid_mask2d.append(torch.tensor(_grid_mask2d, dtype=torch.long))
+            dist_inputs.append(torch.tensor(_dist_inputs, dtype=torch.long))
+            pieces2word.append(torch.tensor(_pieces2word, dtype=torch.long))
+
+        bert_inputs, grid_mask2d, pieces2word, dist_inputs, length = \
+            self.collate_fn(bert_inputs, grid_mask2d, pieces2word, dist_inputs, sent_length)
+
+        return torch.tensor(bert_inputs, dtype=torch.long, device=self.device), \
+               torch.tensor(grid_mask2d, dtype=torch.long, device=self.device), \
+               torch.tensor(pieces2word, dtype=torch.long, device=self.device), \
+               torch.tensor(dist_inputs, dtype=torch.long, device=self.device), \
+               torch.tensor(sent_length, dtype=torch.long, device=self.device)
+
+    def collate_fn(self, bert_inputs, grid_mask2d, pieces2word, dist_inputs, sent_length):
+
+        max_tok = np.max(sent_length)
+        sent_length = torch.LongTensor(sent_length)
+        max_pie = np.max([len(x) for x in bert_inputs])
+        bert_inputs = pad_sequence(bert_inputs, True)
+        batch_size = bert_inputs.size(0)
+
+        def fill(data, new_data):
+            for j, x in enumerate(data):
+                new_data[j, :x.shape[0], :x.shape[1]] = x
+            return new_data
+
+        dis_mat = torch.zeros((batch_size, max_tok, max_tok), dtype=torch.long)
+        dist_inputs = fill(dist_inputs, dis_mat)
+        mask2d_mat = torch.zeros((batch_size, max_tok, max_tok), dtype=torch.bool)
+        grid_mask2d = fill(grid_mask2d, mask2d_mat)
+        sub_mat = torch.zeros((batch_size, max_tok, max_pie), dtype=torch.bool)
+        pieces2word = fill(pieces2word, sub_mat)
+
+        return bert_inputs, grid_mask2d, pieces2word, dist_inputs, sent_length
 
     def convert_index_to_text(self, index, type):
         text = "-".join([str(i) for i in index])
@@ -134,13 +177,13 @@ class W2NER(object):
             ent_p += len(predicts)
         return ent_c, ent_p, ent_r, decode_entities
 
-    def predict(self, sentence):
+    def predict(self, sentences):
         """
         :param data: 输入样本
         :return: 返回实体
         """
         bert_inputs, grid_mask2d, pieces2word, dist_inputs, sent_length = self.process_bert(
-            instance=sentence, tokenizer=self.tokenizer)
+            data=sentences, tokenizer=self.tokenizer)
 
         with torch.no_grad():
             outputs = self.model(bert_inputs, grid_mask2d, dist_inputs, pieces2word, sent_length)
@@ -149,12 +192,18 @@ class W2NER(object):
             outputs = torch.argmax(outputs, -1)
             ent_c, ent_p, ent_r, decode_entities = self.decode(outputs.cpu().numpy(), length.cpu().numpy())
 
-            sentences = {"sentence": sentence, "entity": []}
-            for ent in decode_entities[0]:
-                sentences["entity"].append({"text": ''.join([sentence[x] for x in ent[0]]),
-                                            "type": self.id2label.get(ent[1], 'null')})
+            results = []
+            for ent_list, sentence in zip(decode_entities, sentences):
+                cur_res = {}
+                cur_res['sentence'] = sentence
+                cur_res['entity'] = []
+                for ent in ent_list:
+                    cur_res["entity"].append({"text": ''.join([sentence[x] for x in ent[0]]),
+                                              "index": ent[0],
+                                              "type": self.id2label.get(str(ent[1]), 'null')})
+                results.append(cur_res)
 
-        return sentences
+        return results
 
 
 if __name__ == '__main__':
