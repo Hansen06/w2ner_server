@@ -7,10 +7,13 @@ from flask_cors import *
 import W2NER
 import config
 from flask import Response
+from gevent import monkey
+from gevent.pywsgi import WSGIServer
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.DEBUG)
 
+monkey.patch_all()
 app = flask.Flask(__name__)
 CORS(app, supports_credentials=True)
 
@@ -53,7 +56,8 @@ def ner():
 
 if __name__ == '__main__':
     print('server starting....')
-    app.run(
-        host='0.0.0.0',
-        port=config.port
-    )
+    WSGIServer(('0.0.0.0', config.port) ,app).serve_forever()
+    # app.run(
+    #     host='0.0.0.0',
+    #     port=config.port
+    # )

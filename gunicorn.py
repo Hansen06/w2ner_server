@@ -6,3 +6,5 @@ daemon = 'false'
 worker_connections = 1000
 timeout = 1200
 threads = 2
+
+worker_class = 'gevent'
